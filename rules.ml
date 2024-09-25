@@ -59,8 +59,13 @@ type t = {
 }
 
 let init default =
-  (* {l = [{src = Ipaddr.V4.Prefix.of_string_exn "10.0.0.3/24"; psrc=0; dst=Ipaddr.V4.Prefix.of_string_exn "10.0.0.3/24"; pdst=0; proto=None; action=Some ACCEPT}] ; default} *)
-  {l = [{src = Ipaddr.V4.Prefix.global; psrc=0; dst=Ipaddr.V4.Prefix.global; pdst=0; proto=None; action=Some ACCEPT}] ; default}
+  {l = [{src = Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; psrc=0; dst=Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; pdst=7070; proto=Some `TCP; action=Some ACCEPT};
+        {src = Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; psrc=7070; dst=Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; pdst=0; proto=Some `TCP; action=Some ACCEPT};
+        {src = Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; psrc=0; dst=Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; pdst=8080; proto=Some `UDP; action=Some ACCEPT};
+        {src = Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; psrc=0; dst=Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; pdst=0; proto=Some `ICMP; action=Some ACCEPT};
+        {src = Ipaddr.V4.Prefix.of_string_exn "10.0.0.0/24"; psrc=0; dst=Ipaddr.V4.Prefix.of_string_exn "224.0.0.251/32"; pdst=0; proto=Some `UDP; action=Some ACCEPT};
+        {src = Ipaddr.V4.Prefix.global; psrc=0; dst=Ipaddr.V4.Prefix.global; pdst=0; proto=None; action=Some DROP}];
+        default}
 
 (* Here we apply, for easy testing, a default to accept last ressort rule :x
 let default_accept cb (dest, packet) =
@@ -162,26 +167,29 @@ let update t payload =
       assert false; (* The code should not go there...*)
   end
 
-  let compare_port packet proto r_psrc r_pdst =
-    match proto with
-    | 6 -> (
-      match Tcp.Tcp_packet.Unmarshal.of_cstruct packet with
-      | Result.Error s ->
-          Logs.err (fun m -> m "Can't parse TCP packet: %s" s);
-          false
-      | Result.Ok (tcp_hdr, _payload) ->
-        tcp_hdr.src_port = r_psrc && tcp_hdr.dst_port = r_pdst)  
-        (* TCP*)
-    | 17 -> (
-        match Udp_packet.Unmarshal.of_cstruct packet with
-        | Result.Error s ->
-            Logs.err (fun m -> m "Can't parse UDP packet: %s" s);
-            false
-        | Result.Ok (udp_hdr, _payload) ->
-            udp_hdr.src_port = r_psrc && udp_hdr.dst_port = r_pdst) 
-            (*UDP*)
-    | 1 -> true (*ICMP*)
-    | _ -> true
+  let is_matching_port packet proto r_psrc r_pdst = 
+      match r_psrc, r_pdst, proto with
+      | 0, 0, _ -> true
+      | _, _, 6 -> (
+          (* TCP *)
+          match Tcp.Tcp_packet.Unmarshal.of_cstruct packet with
+          | Result.Error s ->
+              Logs.err (fun m -> m "Can't parse TCP packet: %s" s);
+              false
+          | Result.Ok (tcp_hdr, _payload) ->
+              (r_psrc = 0 || tcp_hdr.src_port = r_psrc) && (r_pdst = 0 || tcp_hdr.dst_port = r_pdst)
+        )
+      | _, _, 17 -> (
+          (* UDP *)
+          match Udp_packet.Unmarshal.of_cstruct packet with
+          | Result.Error s ->
+              Logs.err (fun m -> m "Can't parse UDP packet: %s" s);
+              false
+          | Result.Ok (udp_hdr, _payload) ->
+              (r_psrc = 0 || udp_hdr.src_port = r_psrc) && (r_pdst = 0 || udp_hdr.dst_port = r_pdst)
+        )
+      | _, _, 1 -> true (* ICMP *)
+      | _ -> true
 
 
 
@@ -201,16 +209,16 @@ let filter t (ipv4_hdr, packet) =
     (* If the packet matches the condition and has an accept action *)
     | {src; psrc; dst; pdst; proto; action=Some ACCEPT}::_ when
         match_ip ipv4_hdr.src src && match_ip ipv4_hdr.dst dst &&
-        (proto = None || Ipv4_packet.Unmarshal.int_to_protocol ipv4_hdr.Ipv4_packet.proto = proto) && compare_port packet ipv4_hdr.Ipv4_packet.proto psrc pdst
+        (proto = None || Ipv4_packet.Unmarshal.int_to_protocol ipv4_hdr.Ipv4_packet.proto = proto) && is_matching_port packet ipv4_hdr.Ipv4_packet.proto psrc pdst
         (* TODO: also check the ports :) *)
       -> 
         Log.debug (fun f -> f "Accept a packet from %a to %a..." Ipaddr.V4.pp ipv4_hdr.src Ipaddr.V4.pp ipv4_hdr.dst);
         true
 
     (* Otherwise the packet matches and the action is drop *)
-    | {src; psrc=_; dst; pdst=_; proto; action=Some DROP}::_ when
+    | {src; psrc; dst; pdst; proto; action=Some DROP}::_ when
         match_ip ipv4_hdr.src src && match_ip ipv4_hdr.dst dst &&
-        (proto = None || Ipv4_packet.Unmarshal.int_to_protocol ipv4_hdr.Ipv4_packet.proto = proto)
+        (proto = None || Ipv4_packet.Unmarshal.int_to_protocol ipv4_hdr.Ipv4_packet.proto = proto) && is_matching_port packet ipv4_hdr.Ipv4_packet.proto psrc pdst
         (* TODO: also check the ports :) *)
       -> 
         Log.debug (fun f -> f "Filter out a packet from %a to %a..." Ipaddr.V4.pp ipv4_hdr.src Ipaddr.V4.pp ipv4_hdr.dst);
