@@ -25,6 +25,7 @@ let packages = [
   package ~min:"8.2.0" ~sublibs:["ipv4";"tcp"] "tcpip"; (* There was a breaking API changes in the 8.2 series *)
   package "logs";
   (* package ~min:"4.0.0" "mirage-runtime"; *) (* We want to avoid runtime argument at any cost *)
+  package "duration";
 ]
 
 (* our unikernel needs to know about physical network, and ethernet modules
@@ -33,7 +34,8 @@ let packages = [
 let main = main "Unikernel.Main" ~packages
            (network  @-> network  @->
             ethernet @-> ethernet @->
-            random   @-> mclock   @-> job)
+            random   @-> mclock   @->
+            time     @-> job)
 
 (* we need to pass each of the network-related impls we've made to the
    unikernel, so that it can start the appropriate listeners. *)
@@ -41,4 +43,5 @@ let () = register "simple-fw" [ main
                                  $ public_netif    $ private_netif
                                  $ public_ethernet $ private_ethernet
                                  $ default_random  $ default_monotonic_clock
+                                 $ default_time
                                ]

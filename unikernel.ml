@@ -11,7 +11,8 @@ module Main
     (Public_ethernet : Ethernet.S)
     (Private_ethernet : Ethernet.S)
     (Random : Mirage_crypto_rng_mirage.S)
-    (Clock : Mirage_clock.MCLOCK) =
+    (Clock : Mirage_clock.MCLOCK)
+    (Time : Mirage_time.S) =
 struct
   (* configure logs, so we can use them later *)
   let log = Logs.Src.create "fw" ~doc:"FW device"
@@ -20,18 +21,127 @@ struct
 
   (* the specific impls we're using show up as arguments to start. *)
   let start public_netif private_netif _public_ethernet _private_ethernet _rng
-      () =
+      () _time =
     (* Creates a set of rules (empty) and a default condition (accept) *)
     let filter_rules = Rules.init false in
+
+    (* Send an arp packet over the public Ethernet interface *)
+    let output_ipv4_public dst_mac packet =
+      (* Send the custom packet over the Ethernet interface *)
+      let len = Cstruct.length packet in
+      Public_ethernet.write _public_ethernet dst_mac `IPv4 ~size:len (fun b ->
+          Cstruct.blit packet 0 b 0 len;
+          len)
+      >>= function
+      | Ok () ->
+          Logs.info (fun m -> m "Ipv4 packet sent successfully");
+          Lwt.return_unit
+      | Error e ->
+          Logs.err (fun m ->
+              m "Error sending packet: %a" Public_ethernet.pp_error e);
+          Lwt.return_unit
+    in
+
+    (* Send an arp packet over the private Ethernet interface *)
+    let output_ipv4_private dst_mac packet =
+      let len = Cstruct.length packet in
+      Private_ethernet.write _private_ethernet dst_mac `IPv4 ~size:len (fun b ->
+          Cstruct.blit packet 0 b 0 len;
+          len)
+      >>= function
+      | Ok () ->
+          Logs.info (fun m -> m "Ipv4 packet sent successfully");
+          Lwt.return_unit
+      | Error e ->
+          Logs.err (fun m ->
+              m "Error sending packet: %a" Private_ethernet.pp_error e);
+          Lwt.return_unit
+    in
+
+    let vertex_cover = Vertex_cover.init INITIATE in
+
+    (* Periodic function to send a packet *)
+    let rec send_packet_periodically output_ipv4 count =
+      match vertex_cover.state with
+      | INITIATE when count > 0 ->
+          let dst_mac = Macaddr.of_string_exn "FF:FF:FF:FF:FF:FF" in
+          let packet = Vertex_cover.serialize_message PROB in
+          (* Send the packet using the private interface *)
+          output_ipv4 dst_mac packet >>= fun () ->
+          (* Wait for 5 seconds before sending again *)
+          Time.sleep_ns (Duration.of_sec 5) >>= fun () ->
+          send_packet_periodically output_ipv4 (count - 1)
+      | INITIATE ->
+          vertex_cover.state <- COMPUTING;
+          Vertex_cover.update_degree vertex_cover vertex_cover.map_unik_neighbor;
+          Logs.info (fun m -> m "Moved to state 1 with degree %d" vertex_cover.degree);
+          Lwt.return_unit
+      | _ -> Lwt.return_unit
+    in
+
+    let handle_special_packet :
+        Macaddr.t ->
+        Cstruct.t ->
+        (Macaddr.t -> Cstruct.t -> unit Lwt.t) ->
+        Vertex_cover.interface ->
+        unit Lwt.t =
+     fun src_mac packet output_ipv4 inter ->
+      let cmd = Vertex_cover.parse_message packet in
+      match cmd with
+      | PROB -> (
+          let reply_packet = Vertex_cover.serialize_message REPLY in
+          match
+            Vertex_cover.MacMap.find src_mac vertex_cover.map_unik_neighbor
+          with
+          | None ->
+              let new_neigh : Vertex_cover.unik_neigh = { inter } in
+              vertex_cover.map_unik_neighbor <-
+                vertex_cover.map_unik_neighbor
+                |> Vertex_cover.MacMap.add src_mac new_neigh;
+              Logs.debug (fun m ->
+                    m "Update Mac address from PROB: %s" (Macaddr.to_string src_mac));
+              output_ipv4 src_mac reply_packet
+          | Some _ ->
+              Logs.debug (fun m ->
+                  m "Reveive PROB same Mac address from a unikernel");
+              Lwt.return_unit)
+      | REPLY -> (
+          match
+            Vertex_cover.MacMap.find src_mac vertex_cover.map_unik_neighbor
+          with
+          | None ->
+              let new_neigh : Vertex_cover.unik_neigh = { inter } in
+              vertex_cover.map_unik_neighbor <-
+                vertex_cover.map_unik_neighbor
+                |> Vertex_cover.MacMap.add src_mac new_neigh;
+              Vertex_cover.update_degree vertex_cover vertex_cover.map_unik_neighbor;
+              Logs.debug (fun m ->
+                m "Update Mac address from REPLY: %s" (Macaddr.to_string src_mac));
+              Lwt.return_unit
+          | Some _ ->
+              Logs.debug (fun m ->
+                  m "Reveive REPLY same Mac address from a unikernel");
+              Lwt.return_unit)
+      | _ -> Lwt.return_unit
+    in
 
     (* Takes an IPv4 [packet], unmarshal it, check if we're the destination and
        the payload is some sort of rule update, apply that, and if we're not the
        destination, use the filter_rules to [out] the packet or not. *)
-    let is_forwardable packet =
+    let is_forwardable :
+        Ethernet.Packet.t ->
+        Cstruct.t ->
+        (Macaddr.t -> Cstruct.t -> unit Lwt.t) ->
+        Vertex_cover.interface ->
+        bool =
+     fun header packet output_ipv4 inter ->
       (* Handle IPv4 only... *)
       match Ipv4_packet.Unmarshal.of_cstruct packet with
-      | Result.Error s ->
-          Logs.err (fun m -> m "Can't parse IPv4 packet: %s" s);
+      | Result.Error _s ->
+          (* Logs.err (fun m -> m "Can't parse IPv4 packet: %s" s); *)
+          let _ =
+            handle_special_packet header.source packet output_ipv4 inter
+          in
           false
       (* Otherwise try to forward (or not) the packet *)
       | Result.Ok (ipv4_hdr, payload) ->
@@ -80,7 +190,9 @@ struct
         | Ok (header, payload) -> (
             match header.Ethernet.Packet.ethertype with
             | `ARP -> output_private frame
-            | `IPv4 when is_forwardable payload -> output_private frame
+            | `IPv4 when is_forwardable header payload output_ipv4_public Public
+              ->
+                output_private frame
             | _ -> Lwt.return_unit)
         | Error s ->
             Log.debug (fun f -> f "dropping Ethernet frame: %s" s);
@@ -104,7 +216,9 @@ struct
         | Ok (header, payload) -> (
             match header.Ethernet.Packet.ethertype with
             | `ARP -> output_public frame
-            | `IPv4 when is_forwardable payload -> output_public frame
+            | `IPv4
+              when is_forwardable header payload output_ipv4_private Private ->
+                output_public frame
             | _ -> Lwt.return_unit)
         | Error s ->
             Log.debug (fun f -> f "dropping Ethernet frame: %s" s);
@@ -127,6 +241,13 @@ struct
        line utility might be useful in trying to see whether your unikernel is
        up. *)
 
+    Lwt.async (fun () -> send_packet_periodically output_ipv4_private 3);
+    Lwt.async (fun () -> send_packet_periodically output_ipv4_public 3);
+
     (* start both listeners, and continue as long as both are working. *)
-    Lwt.pick [ listen_public; listen_private ]
+    Lwt.pick
+      [
+        listen_public;
+        listen_private;
+      ]
 end
