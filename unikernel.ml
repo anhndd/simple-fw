@@ -104,7 +104,8 @@ struct
           | Some _ ->
               Logs.debug (fun m ->
                   m "Reveive PROB same Mac address from a unikernel");
-              Lwt.return_unit)
+              Lwt.return_unit
+        )
       | REPLY -> (
           match
             Vertex_cover.MacMap.find src_mac vertex_cover.map_unik_neighbor
@@ -121,31 +122,10 @@ struct
           | Some _ ->
               Logs.debug (fun m ->
                   m "Reveive REPLY same Mac address from a unikernel");
-              Lwt.return_unit)
+              Lwt.return_unit
+        )
       | _ -> Lwt.return_unit
-    in
 
-    (* Takes an IPv4 [packet], unmarshal it, check if we're the destination and
-       the payload is some sort of rule update, apply that, and if we're not the
-       destination, use the filter_rules to [out] the packet or not. *)
-    let is_forwardable :
-        Ethernet.Packet.t ->
-        Cstruct.t ->
-        (Macaddr.t -> Cstruct.t -> unit Lwt.t) ->
-        Vertex_cover.interface ->
-        bool =
-     fun header packet output_ipv4 inter ->
-      (* Handle IPv4 only... *)
-      match Ipv4_packet.Unmarshal.of_cstruct packet with
-      | Result.Error _s ->
-          (* Logs.err (fun m -> m "Can't parse IPv4 packet: %s" s); *)
-          let _ =
-            handle_special_packet header.source packet output_ipv4 inter
-          in
-          false
-      (* Otherwise try to forward (or not) the packet *)
-      | Result.Ok (ipv4_hdr, payload) ->
-          Rules.filter filter_rules (ipv4_hdr, payload)
     in
 
     (* Forward the (dest, packet) [packet] to the public interface, using [dest] to understand how to route *)
@@ -190,9 +170,20 @@ struct
         | Ok (header, payload) -> (
             match header.Ethernet.Packet.ethertype with
             | `ARP -> output_private frame
-            | `IPv4 when is_forwardable header payload output_ipv4_public Public
-              ->
-                output_private frame
+            | `IPv4 -> (
+              (* Takes an IPv4 packet [payload], unmarshal it, check if it's possible to
+                 unmarshall it (if not, it may be a vertex coverage algorithm packet),
+                 otherwise use the filter_rules to [out] the packet or not. *)
+              match Ipv4_packet.Unmarshal.of_cstruct payload with
+              | Result.Error _s ->
+                  (* Logs.err (fun m -> m "Can't parse IPv4 packet: %s" s); *)
+                  handle_special_packet header.source payload output_ipv4_private Public
+              (* Otherwise try to forward (or not) the packet *)
+              | Result.Ok (ipv4_hdr, payload) when Rules.filter filter_rules (ipv4_hdr, payload) ->
+                  output_public frame
+              | Result.Ok _ -> (* The packet is not forwardable according to the current ruleset *)
+                  Lwt.return_unit
+              )
             | _ -> Lwt.return_unit)
         | Error s ->
             Log.debug (fun f -> f "dropping Ethernet frame: %s" s);
@@ -216,9 +207,21 @@ struct
         | Ok (header, payload) -> (
             match header.Ethernet.Packet.ethertype with
             | `ARP -> output_public frame
-            | `IPv4
-              when is_forwardable header payload output_ipv4_private Private ->
-                output_public frame
+            | `IPv4 -> (
+              (* Takes an IPv4 packet [payload], unmarshal it, check if it's possible to
+                 unmarshall it (if not, it may be a vertex coverage algorithm packet),
+                 otherwise use the filter_rules to [out] the packet or not. *)
+              match Ipv4_packet.Unmarshal.of_cstruct payload with
+              | Result.Error _s ->
+                  (* Logs.err (fun m -> m "Can't parse IPv4 packet: %s" s); *)
+                  (* handle_special_packet checks if that's really a vertex coverage packet *)
+                  handle_special_packet header.source payload output_ipv4_public Private
+              (* Otherwise try to forward (or not) the packet *)
+              | Result.Ok (ipv4_hdr, payload) when Rules.filter filter_rules (ipv4_hdr, payload) ->
+                  output_public frame
+              | Result.Ok _ -> (* The packet is not forwardable according to the current ruleset *)
+                  Lwt.return_unit
+              )
             | _ -> Lwt.return_unit)
         | Error s ->
             Log.debug (fun f -> f "dropping Ethernet frame: %s" s);
